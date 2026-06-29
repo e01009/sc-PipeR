@@ -1,0 +1,38 @@
+project:
+  name: scPipeR_ver0
+  organism: human
+  seed: 1234
+
+input:
+  type: 10x
+  path: testData/pbmc3k_filtered_gene_bc_matrices/filtered_gene_bc_matrices/hg19
+  project_name: scPipeR_sample
+  min_cells: 3
+
+qc:
+  min_features: 200
+  max_features: 6000
+  max_percent_mt: 10
+
+normalization:
+  method: LogNormalize
+  scale_factor: 10000
+  variable_features: vst
+  n_variable_features: 2000
+
+reduction:
+  n_pcs: 30
+  umap_dims: 30
+
+clustering:
+  resolution: 0.5
+
+markers:
+  logfc_threshold: 0.25
+  min_pct: 0.1
+  only_pos: true
+
+output:
+  base_dir: Output
+  run_name: null
+  save_seurat_object: true
