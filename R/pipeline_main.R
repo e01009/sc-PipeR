@@ -8,26 +8,8 @@ abort <- function(message) {
   stop(message, call. = FALSE)
 }
 
-required_packages <- c(
-  "yaml",
-  "jsonlite",
-  "Seurat",
-  "SeuratObject",
-  "fs",
-  "glue",
-  "readr",
-  "dplyr",
-  "tibble",
-  "sessioninfo"
-)
-
-missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_packages) > 0) {
-  abort(paste0(
-    "Missing required package(s): ",
-    paste(missing_packages, collapse = ", "),
-    ". Install/restore these in renv before running the pipeline."
-  ))
+if (!requireNamespace("yaml", quietly = TRUE)) {
+  abort("Missing required package: yaml. Install/restore it in renv before running the pipeline.")
 }
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -51,8 +33,204 @@ get_param <- function(path, default = NULL, required = FALSE) {
   value %||% default
 }
 
+validate_config <- function(config) {
+  errors <- character()
+
+  add_error <- function(message) {
+    errors <<- c(errors, message)
+  }
+
+  get_config_value <- function(path) {
+    value <- config
+    for (key in strsplit(path, "\\.", fixed = FALSE)[[1]]) {
+      if (!is.list(value) || is.null(value[[key]])) {
+        return(NULL)
+      }
+      value <- value[[key]]
+    }
+    value
+  }
+
+  is_scalar_value <- function(value) {
+    !is.null(value) && length(value) == 1 && !is.na(value)
+  }
+
+  validate_section <- function(path) {
+    value <- get_config_value(path)
+    if (is.null(value) || !is.list(value)) {
+      add_error(paste0(path, " must be a mapping."))
+    }
+  }
+
+  validate_string <- function(path, required = TRUE, allowed = NULL, allow_null = FALSE) {
+    value <- get_config_value(path)
+
+    if (is.null(value)) {
+      if (required && !allow_null) add_error(paste0(path, " is required."))
+      return(invisible(NULL))
+    }
+
+    if (!is_scalar_value(value) || !is.character(value) || !nzchar(trimws(value))) {
+      if (allow_null && is.null(value)) return(invisible(NULL))
+      add_error(paste0(path, " must be a non-empty string."))
+      return(invisible(NULL))
+    }
+
+    if (!is.null(allowed) && !tolower(trimws(value)) %in% allowed) {
+      add_error(paste0(path, " must be one of: ", paste(allowed, collapse = ", "), "."))
+    }
+  }
+
+  validate_number <- function(path, required = TRUE, integer = FALSE, min = NULL, max = NULL, positive = FALSE) {
+    value <- get_config_value(path)
+
+    if (is.null(value)) {
+      if (required) add_error(paste0(path, " is required."))
+      return(invisible(NULL))
+    }
+
+    if (!is_scalar_value(value) || !is.numeric(value)) {
+      add_error(paste0(path, " must be a numeric value."))
+      return(invisible(NULL))
+    }
+
+    if (integer && value != as.integer(value)) {
+      add_error(paste0(path, " must be an integer."))
+    }
+    if (positive && value <= 0) {
+      add_error(paste0(path, " must be > 0."))
+    }
+    if (!is.null(min) && value < min) {
+      add_error(paste0(path, " must be >= ", min, "."))
+    }
+    if (!is.null(max) && value > max) {
+      add_error(paste0(path, " must be <= ", max, "."))
+    }
+  }
+
+  validate_bool <- function(path, required = TRUE) {
+    value <- get_config_value(path)
+
+    if (is.null(value)) {
+      if (required) add_error(paste0(path, " is required."))
+      return(invisible(NULL))
+    }
+
+    if (!is_scalar_value(value) || !is.logical(value)) {
+      add_error(paste0(path, " must be true or false."))
+    }
+  }
+
+  if (!is.list(config)) {
+    abort("Config validation failed:\n- Config file must contain a YAML mapping.")
+  }
+
+  for (section in c("project", "input", "qc", "normalization", "reduction", "clustering", "markers", "output")) {
+    validate_section(section)
+  }
+
+  validate_string("project.name", required = FALSE)
+  validate_string("project.organism", allowed = c("human", "mouse"))
+  validate_number("project.seed", integer = TRUE)
+
+  validate_string("input.type", allowed = c("10x", "rds"))
+  validate_string("input.path")
+  validate_string("input.project_name", required = FALSE)
+  validate_number("input.min_cells", integer = TRUE, min = 0)
+
+  validate_number("qc.min_features", integer = TRUE, min = 0)
+  validate_number("qc.max_features", integer = TRUE, min = 0)
+  validate_number("qc.max_percent_mt", min = 0, max = 100)
+
+  validate_string("normalization.method", allowed = c("lognormalize", "clr", "rc"))
+  validate_number("normalization.scale_factor", positive = TRUE)
+  validate_string("normalization.variable_features", allowed = c("vst", "mean.var.plot", "dispersion"))
+  validate_number("normalization.n_variable_features", integer = TRUE, min = 1)
+
+  validate_number("reduction.n_pcs", integer = TRUE, min = 2)
+  validate_number("reduction.umap_dims", integer = TRUE, min = 2)
+
+  validate_number("clustering.resolution", min = 0)
+
+  validate_number("markers.logfc_threshold", min = 0)
+  validate_number("markers.min_pct", min = 0, max = 1)
+  validate_bool("markers.only_pos")
+
+  validate_string("output.base_dir")
+  validate_bool("output.save_seurat_object")
+
+  run_name_value <- get_config_value("output.run_name")
+  if (!is.null(run_name_value) && (!is_scalar_value(run_name_value) || !is.character(run_name_value))) {
+    add_error("output.run_name must be null or a string.")
+  }
+
+  min_features_value <- get_config_value("qc.min_features")
+  max_features_value <- get_config_value("qc.max_features")
+  if (
+    is.numeric(min_features_value) &&
+      is.numeric(max_features_value) &&
+      length(min_features_value) == 1 &&
+      length(max_features_value) == 1 &&
+      !is.na(min_features_value) &&
+      !is.na(max_features_value) &&
+      min_features_value > max_features_value
+  ) {
+    add_error("qc.min_features cannot be greater than qc.max_features.")
+  }
+
+  input_type_value <- get_config_value("input.type")
+  input_path_value <- get_config_value("input.path")
+  if (is_scalar_value(input_path_value) && is.character(input_path_value)) {
+    if (!file.exists(input_path_value)) {
+      add_error(paste0("input.path does not exist: ", normalizePath(input_path_value, mustWork = FALSE)))
+    }
+    if (
+      is_scalar_value(input_type_value) &&
+        is.character(input_type_value) &&
+        tolower(trimws(input_type_value)) == "rds"
+    ) {
+      if (dir.exists(input_path_value)) {
+        add_error("For input.type 'rds', input.path must point to a .rds file, not a directory.")
+      }
+      if (!grepl("\\.rds$", input_path_value, ignore.case = TRUE)) {
+        add_error("For input.type 'rds', input.path must point to a file ending in .rds.")
+      }
+    }
+  }
+
+  if (length(errors) > 0) {
+    abort(paste0("Config validation failed:\n- ", paste(errors, collapse = "\n- ")))
+  }
+
+  invisible(TRUE)
+}
+
+validate_config(params)
+
+required_packages <- c(
+  "jsonlite",
+  "Seurat",
+  "SeuratObject",
+  "Matrix",
+  "fs",
+  "glue",
+  "readr",
+  "dplyr",
+  "tibble",
+  "sessioninfo"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  abort(paste0(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install/restore these in renv before running the pipeline."
+  ))
+}
+
 project_name <- get_param("input.project_name", get_param("project.name", "scPipeR_sample"))
-input_type <- tolower(get_param("input.type", "10x"))
+input_type <- tolower(trimws(as.character(get_param("input.type", "10x"))))
 input_path <- get_param("input.path", required = TRUE)
 organism <- tolower(get_param("project.organism", "human"))
 seed <- as.integer(get_param("project.seed", 1234))
@@ -81,6 +259,8 @@ run_name <- get_param(
   paste0(format(Sys.time(), "%Y%m%d_%H%M%S"), "_", project_name)
 )
 save_seurat_object <- isTRUE(get_param("output.save_seurat_object", TRUE))
+feature_count_column <- NULL
+count_column <- NULL
 
 resolve_10x_dir <- function(path) {
   expected_files <- c("matrix.mtx", "barcodes.tsv", "genes.tsv")
@@ -127,22 +307,6 @@ resolve_10x_dir <- function(path) {
   ))
 }
 
-if (!input_type %in% c("10x", "rds")) {
-  abort("input.type must be either '10x' or 'rds'.")
-}
-
-if (!file.exists(input_path)) {
-  abort(paste0("Input path not found: ", normalizePath(input_path, mustWork = FALSE)))
-}
-
-if (min_features > max_features) {
-  abort("qc.min_features cannot be greater than qc.max_features.")
-}
-
-if (n_pcs < 2) {
-  abort("reduction.n_pcs must be at least 2.")
-}
-
 set.seed(seed)
 
 run_dir <- file.path(output_base_dir, run_name)
@@ -181,10 +345,47 @@ qc_summary <- function(object, stage) {
     stage = stage,
     cells = ncol(object),
     genes = nrow(object),
-    median_features = stats::median(object$nFeature_RNA),
-    median_counts = stats::median(object$nCount_RNA),
+    median_features = stats::median(object[[feature_count_column]][, 1]),
+    median_counts = stats::median(object[[count_column]][, 1]),
     median_percent_mt = stats::median(object$percent.mt),
     mean_percent_mt = mean(object$percent.mt)
+  )
+}
+
+get_counts_matrix <- function(object, assay) {
+  tryCatch(
+    SeuratObject::GetAssayData(object = object, assay = assay, layer = "counts"),
+    error = function(layer_error) {
+      tryCatch(
+        SeuratObject::GetAssayData(object = object, assay = assay, slot = "counts"),
+        error = function(slot_error) {
+          abort(paste0(
+            "Unable to read counts from assay '",
+            assay,
+            "'. The .rds input must contain counts data for QC filtering."
+          ))
+        }
+      )
+    }
+  )
+}
+
+prepare_qc_columns <- function(object) {
+  assay <- SeuratObject::DefaultAssay(object)
+  feature_col <- paste0("nFeature_", assay)
+  count_col <- paste0("nCount_", assay)
+
+  if (!all(c(feature_col, count_col) %in% colnames(object@meta.data))) {
+    counts <- get_counts_matrix(object, assay)
+    object[[feature_col]] <- Matrix::colSums(counts > 0)
+    object[[count_col]] <- Matrix::colSums(counts)
+  }
+
+  list(
+    object = object,
+    feature_col = feature_col,
+    count_col = count_col,
+    assay = assay
   )
 }
 
@@ -207,11 +408,25 @@ if (input_type == "10x") {
     min.features = 0
   )
 } else {
-  seu <- readRDS(input_path)
+  seu <- tryCatch(
+    readRDS(input_path),
+    error = function(err) {
+      abort(paste0("Unable to read .rds input: ", conditionMessage(err)))
+    }
+  )
   if (!inherits(seu, "Seurat")) {
     abort("The .rds input must contain a Seurat object.")
   }
+  if (ncol(seu) == 0 || nrow(seu) == 0) {
+    abort("The .rds Seurat object must contain at least one cell and one feature.")
+  }
 }
+
+qc_prep <- prepare_qc_columns(seu)
+seu <- qc_prep$object
+feature_count_column <- qc_prep$feature_col
+count_column <- qc_prep$count_col
+active_assay <- qc_prep$assay
 
 mt_pattern <- switch(
   organism,
@@ -226,12 +441,12 @@ seu[["percent.mt"]] <- Seurat::PercentageFeatureSet(seu, pattern = mt_pattern)
 qc_before <- qc_summary(seu, "before_filtering")
 
 log_message(
-  "Filtering cells with nFeature_RNA >= {min_features}, nFeature_RNA <= {max_features}, percent.mt <= {max_percent_mt}."
+  "Filtering cells with {feature_count_column} >= {min_features}, {feature_count_column} <= {max_features}, percent.mt <= {max_percent_mt}."
 )
 cell_metadata <- seu@meta.data
 keep_cells <- rownames(cell_metadata)[
-  cell_metadata$nFeature_RNA >= min_features &
-    cell_metadata$nFeature_RNA <= max_features &
+  cell_metadata[[feature_count_column]] >= min_features &
+    cell_metadata[[feature_count_column]] <= max_features &
     cell_metadata$percent.mt <= max_percent_mt
 ]
 seu <- subset(seu, cells = keep_cells)
@@ -311,10 +526,13 @@ run_metadata <- list(
   project_name = project_name,
   input_type = input_type,
   input_path = normalizePath(input_path, mustWork = FALSE),
+  active_assay = active_assay,
   organism = organism,
   seed = seed,
   parameters = list(
     min_cells = min_cells,
+    feature_count_column = feature_count_column,
+    count_column = count_column,
     min_features = min_features,
     max_features = max_features,
     max_percent_mt = max_percent_mt,
@@ -359,7 +577,9 @@ summary_lines <- c(
   "sc-PipeR ver0 run complete",
   paste0("Completed: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
   paste0("Output directory: ", normalizePath(run_dir, mustWork = FALSE)),
-  paste0("Input directory: ", normalizePath(input_path, mustWork = FALSE)),
+  paste0("Input path: ", normalizePath(input_path, mustWork = FALSE)),
+  paste0("Input type: ", input_type),
+  paste0("Active assay: ", active_assay),
   paste0("Cells removed by filtering: ", qc_before$cells - qc_after$cells),
   paste0("Cells before filtering: ", qc_before$cells),
   paste0("Cells after filtering: ", qc_after$cells),
