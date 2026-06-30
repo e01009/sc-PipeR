@@ -1,0 +1,63 @@
+# R history and session files
+.Rhistory
+.Rapp.history
+.RData
+.RDataTmp
+.Ruserdata
+
+# R environment variables and local project state
+.Renviron
+.Rproj.user/
+
+# R package/build/check artifacts
+*-Ex.R
+/*.tar.gz
+/*.Rcheck/
+
+# R Markdown, knitr, pkgdown, and publishing artifacts
+*_cache/
+/cache/
+.cache/
+*.utf8.md
+*.knit.md
+vignettes/*.html
+vignettes/*.pdf
+docs/
+rsconnect/
+
+# renv local dependency/cache directories
+/renv/library/
+/renv/local/
+/renv/cellar/
+/renv/lock/
+/renv/python/
+/renv/sandbox/
+/renv/staging/
+
+# sc-PipeR generated outputs and local data
+/Output/
+/output/
+/logs/
+/testData/
+
+# Large local analysis objects and generated reports
+*.rds
+*.Rds
+*.RDS
+*.h5
+*.h5ad
+*.loom
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local planning or agent workspace files
+plan.md
+/.agents/
+/.codex/
+
+# Translation temp files
+po/*~
