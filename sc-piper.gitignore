@@ -51,5 +51,8 @@ rsconnect/
 #output files
 output/
 
-#test files
+#test file
 testData/
+
+#other
+plan.md
