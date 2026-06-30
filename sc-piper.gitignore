@@ -50,3 +50,6 @@ rsconnect/
 
 #output files
 output/
+
+#test files
+testData/
