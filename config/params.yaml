@@ -1,5 +1,5 @@
 project:
-  name: scPipeR_ver0
+  name: scPipeR_ver0.1
   organism: human
   seed: 1234
 
@@ -31,6 +31,17 @@ markers:
   logfc_threshold: 0.25
   min_pct: 0.1
   only_pos: true
+
+plots:
+  enabled: true
+  export_pdf: false
+  width: 8
+  height: 6
+  dpi: 300
+  top_marker_count: 10
+
+report:
+  enabled: true
 
 output:
   base_dir: Output

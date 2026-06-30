@@ -125,7 +125,7 @@ validate_config <- function(config) {
     abort("Config validation failed:\n- Config file must contain a YAML mapping.")
   }
 
-  for (section in c("project", "input", "qc", "normalization", "reduction", "clustering", "markers", "output")) {
+  for (section in c("project", "input", "qc", "normalization", "reduction", "clustering", "markers", "plots", "report", "output")) {
     validate_section(section)
   }
 
@@ -155,6 +155,15 @@ validate_config <- function(config) {
   validate_number("markers.logfc_threshold", min = 0)
   validate_number("markers.min_pct", min = 0, max = 1)
   validate_bool("markers.only_pos")
+
+  validate_bool("plots.enabled")
+  validate_bool("plots.export_pdf")
+  validate_number("plots.width", positive = TRUE)
+  validate_number("plots.height", positive = TRUE)
+  validate_number("plots.dpi", integer = TRUE, min = 72)
+  validate_number("plots.top_marker_count", integer = TRUE, min = 1)
+
+  validate_bool("report.enabled")
 
   validate_string("output.base_dir")
   validate_bool("output.save_seurat_object")
@@ -219,6 +228,12 @@ required_packages <- c(
   "tibble",
   "sessioninfo"
 )
+if (isTRUE(get_param("plots.enabled", TRUE))) {
+  required_packages <- c(required_packages, "ggplot2")
+}
+if (isTRUE(get_param("report.enabled", TRUE))) {
+  required_packages <- c(required_packages, "rmarkdown")
+}
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
@@ -252,6 +267,15 @@ clustering_resolution <- as.numeric(get_param("clustering.resolution", 0.5))
 marker_logfc_threshold <- as.numeric(get_param("markers.logfc_threshold", 0.25))
 marker_min_pct <- as.numeric(get_param("markers.min_pct", 0.1))
 marker_only_pos <- isTRUE(get_param("markers.only_pos", TRUE))
+
+plots_enabled <- isTRUE(get_param("plots.enabled", TRUE))
+plots_export_pdf <- isTRUE(get_param("plots.export_pdf", FALSE))
+plot_width <- as.numeric(get_param("plots.width", 8))
+plot_height <- as.numeric(get_param("plots.height", 6))
+plot_dpi <- as.integer(get_param("plots.dpi", 300))
+top_marker_count <- as.integer(get_param("plots.top_marker_count", 10))
+
+report_enabled <- isTRUE(get_param("report.enabled", TRUE))
 
 output_base_dir <- get_param("output.base_dir", "Output")
 run_name <- get_param(
@@ -314,6 +338,11 @@ dirs <- c(
   run_dir,
   file.path(run_dir, "objects"),
   file.path(run_dir, "tables"),
+  file.path(run_dir, "plots"),
+  file.path(run_dir, "plots", "qc"),
+  file.path(run_dir, "plots", "reduction"),
+  file.path(run_dir, "plots", "markers"),
+  file.path(run_dir, "report"),
   file.path(run_dir, "logs"),
   file.path(run_dir, "config")
 )
@@ -328,7 +357,7 @@ log_message <- function(...) {
 
 writeLines(
   c(
-    "sc-PipeR ver0 run",
+    "sc-PipeR version 0.1 run",
     paste0("Started: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
     paste0("R version: ", getRversion()),
     paste0("Config: ", normalizePath(config_path, mustWork = FALSE)),
@@ -389,6 +418,180 @@ prepare_qc_columns <- function(object) {
   )
 }
 
+save_plot <- function(plot, path_without_ext, width = plot_width, height = plot_height) {
+  png_path <- paste0(path_without_ext, ".png")
+  ggplot2::ggsave(
+    filename = png_path,
+    plot = plot,
+    width = width,
+    height = height,
+    dpi = plot_dpi,
+    units = "in"
+  )
+
+  output_paths <- png_path
+  if (plots_export_pdf) {
+    pdf_path <- paste0(path_without_ext, ".pdf")
+    ggplot2::ggsave(
+      filename = pdf_path,
+      plot = plot,
+      width = width,
+      height = height,
+      units = "in"
+    )
+    output_paths <- c(output_paths, pdf_path)
+  }
+
+  output_paths
+}
+
+write_plot_outputs <- function(object, marker_table) {
+  plot_paths <- character()
+
+  if (!plots_enabled) {
+    return(plot_paths)
+  }
+
+  log_message("Writing plots.")
+
+  qc_plot <- Seurat::VlnPlot(
+    object,
+    features = c(feature_count_column, count_column, "percent.mt"),
+    ncol = 3,
+    pt.size = 0.1
+  )
+  plot_paths <- c(plot_paths, save_plot(qc_plot, file.path(run_dir, "plots", "qc", "qc_violin"), width = 12, height = 5))
+
+  scatter_feature_count <- Seurat::FeatureScatter(
+    object,
+    feature1 = count_column,
+    feature2 = feature_count_column
+  )
+  plot_paths <- c(plot_paths, save_plot(scatter_feature_count, file.path(run_dir, "plots", "qc", "feature_count_scatter")))
+
+  scatter_mt_count <- Seurat::FeatureScatter(
+    object,
+    feature1 = count_column,
+    feature2 = "percent.mt"
+  )
+  plot_paths <- c(plot_paths, save_plot(scatter_mt_count, file.path(run_dir, "plots", "qc", "mitochondrial_count_scatter")))
+
+  elbow_plot <- Seurat::ElbowPlot(object, ndims = available_pcs)
+  plot_paths <- c(plot_paths, save_plot(elbow_plot, file.path(run_dir, "plots", "reduction", "pca_elbow")))
+
+  umap_cluster_plot <- Seurat::DimPlot(object, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+  plot_paths <- c(plot_paths, save_plot(umap_cluster_plot, file.path(run_dir, "plots", "reduction", "umap_clusters")))
+
+  umap_qc_plot <- Seurat::FeaturePlot(
+    object,
+    features = c(feature_count_column, count_column, "percent.mt"),
+    reduction = "umap",
+    ncol = 3
+  )
+  plot_paths <- c(plot_paths, save_plot(umap_qc_plot, file.path(run_dir, "plots", "reduction", "umap_qc_metrics"), width = 12, height = 5))
+
+  if (nrow(marker_table) > 0 && "cluster" %in% colnames(marker_table) && "gene" %in% colnames(marker_table)) {
+    marker_score_column <- if ("avg_log2FC" %in% colnames(marker_table)) "avg_log2FC" else "avg_logFC"
+    if (marker_score_column %in% colnames(marker_table)) {
+      ordered_markers <- marker_table[order(marker_table$cluster, -marker_table[[marker_score_column]]), , drop = FALSE]
+      top_markers <- dplyr::bind_rows(lapply(split(ordered_markers, ordered_markers$cluster), utils::head, top_marker_count))
+      top_marker_genes <- unique(top_markers$gene)
+
+      if (length(top_marker_genes) > 0) {
+        marker_plot <- Seurat::DotPlot(object, features = top_marker_genes) +
+          ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+        plot_paths <- c(plot_paths, save_plot(marker_plot, file.path(run_dir, "plots", "markers", "top_marker_dotplot"), width = 12, height = 7))
+      }
+    }
+  }
+
+  plot_paths
+}
+
+relative_path <- function(path) {
+  normalized_path <- normalizePath(path, winslash = "/", mustWork = FALSE)
+  normalized_run_dir <- normalizePath(run_dir, winslash = "/", mustWork = FALSE)
+  sub(paste0("^", gsub("([\\^$.|?*+(){}\\[\\]\\\\])", "\\\\\\1", normalized_run_dir), "/?"), "", normalized_path)
+}
+
+write_report <- function(plot_paths) {
+  if (!report_enabled) {
+    return(NULL)
+  }
+
+  log_message("Writing HTML report.")
+
+  report_rmd <- file.path(run_dir, "report", "sc_piper_report.Rmd")
+  report_html <- file.path(run_dir, "report", "sc_piper_report.html")
+  png_plot_paths <- plot_paths[grepl("\\.png$", plot_paths, ignore.case = TRUE)]
+  plot_sections <- if (length(png_plot_paths) > 0) {
+    paste0(
+      "### ",
+      tools::file_path_sans_ext(basename(png_plot_paths)),
+      "\n\n![](../",
+      vapply(png_plot_paths, relative_path, character(1)),
+      ")\n"
+    )
+  } else {
+    "No plots were exported for this run.\n"
+  }
+
+  report_lines <- c(
+    "---",
+    "title: \"sc-PipeR version 0.1 report\"",
+    "output:",
+    "  html_document:",
+    "    toc: true",
+    "    toc_depth: 2",
+    "---",
+    "",
+    "```{r setup, include=FALSE}",
+    "knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)",
+    "```",
+    "",
+    "## Run Summary",
+    "",
+    paste0("- Project: ", project_name),
+    paste0("- Input type: ", input_type),
+    paste0("- Input path: ", normalizePath(input_path, mustWork = FALSE)),
+    paste0("- Active assay: ", active_assay),
+    paste0("- Cells before filtering: ", qc_before$cells),
+    paste0("- Cells after filtering: ", qc_after$cells),
+    paste0("- Genes/features: ", qc_after$genes),
+    paste0("- PCs used: ", available_pcs),
+    paste0("- UMAP dimensions used: ", umap_dims),
+    paste0("- Clusters: ", dplyr::n_distinct(metadata$seurat_clusters)),
+    paste0("- Marker rows: ", nrow(markers)),
+    "",
+    "## QC Summary",
+    "",
+    "```{r}",
+    "readr::read_csv('../tables/qc_summary.csv', show_col_types = FALSE)",
+    "```",
+    "",
+    "## Cluster Counts",
+    "",
+    "```{r}",
+    "readr::read_csv('../tables/cluster_counts.csv', show_col_types = FALSE)",
+    "```",
+    "",
+    "## Plots",
+    "",
+    plot_sections
+  )
+
+  writeLines(report_lines, con = report_rmd)
+  rmarkdown::render(
+    input = report_rmd,
+    output_file = basename(report_html),
+    output_dir = dirname(report_html),
+    quiet = TRUE,
+    envir = new.env(parent = globalenv())
+  )
+
+  report_html
+}
+
 log_message("Loading input as {input_type}.")
 if (input_type == "10x") {
   input_path <- resolve_10x_dir(input_path)
@@ -432,7 +635,7 @@ mt_pattern <- switch(
   organism,
   human = "^MT-",
   mouse = "^mt-",
-  abort("Unsupported project.organism. Use 'human' or 'mouse' for ver0.")
+    abort("Unsupported project.organism. Use 'human' or 'mouse'.")
 )
 
 log_message("Calculating QC metrics.")
@@ -546,7 +749,14 @@ run_metadata <- list(
     clustering_resolution = clustering_resolution,
     marker_logfc_threshold = marker_logfc_threshold,
     marker_min_pct = marker_min_pct,
-    marker_only_pos = marker_only_pos
+    marker_only_pos = marker_only_pos,
+    plots_enabled = plots_enabled,
+    plots_export_pdf = plots_export_pdf,
+    plot_width = plot_width,
+    plot_height = plot_height,
+    plot_dpi = plot_dpi,
+    top_marker_count = top_marker_count,
+    report_enabled = report_enabled
   )
 )
 
@@ -568,13 +778,22 @@ if (save_seurat_object) {
   saveRDS(seu, file.path(run_dir, "objects", "seurat_processed.rds"))
 }
 
+plot_paths <- write_plot_outputs(seu, markers)
+if (length(plot_paths) > 0) {
+  readr::write_csv(
+    tibble::tibble(path = vapply(plot_paths, relative_path, character(1))),
+    file.path(run_dir, "plots", "plot_manifest.csv")
+  )
+}
+report_path <- write_report(plot_paths)
+
 writeLines(
   capture.output(sessioninfo::session_info()),
   con = file.path(run_dir, "logs", "sessioninfo.txt")
 )
 
 summary_lines <- c(
-  "sc-PipeR ver0 run complete",
+  "sc-PipeR version 0.1 run complete",
   paste0("Completed: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
   paste0("Output directory: ", normalizePath(run_dir, mustWork = FALSE)),
   paste0("Input path: ", normalizePath(input_path, mustWork = FALSE)),
@@ -587,7 +806,9 @@ summary_lines <- c(
   paste0("PCs used: ", available_pcs),
   paste0("UMAP dims used: ", umap_dims),
   paste0("Clusters: ", dplyr::n_distinct(metadata$seurat_clusters)),
-  paste0("Marker rows: ", nrow(markers))
+  paste0("Marker rows: ", nrow(markers)),
+  paste0("Plot files: ", length(plot_paths)),
+  paste0("HTML report: ", report_path %||% "not generated")
 )
 writeLines(summary_lines, con = file.path(run_dir, "logs", "summary.txt"))
 
