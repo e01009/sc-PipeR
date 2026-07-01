@@ -125,7 +125,7 @@ validate_config <- function(config) {
     abort("Config validation failed:\n- Config file must contain a YAML mapping.")
   }
 
-  for (section in c("project", "input", "qc", "normalization", "reduction", "clustering", "markers", "plots", "report", "output")) {
+  for (section in c("project", "input", "qc", "normalization", "modules", "reduction", "clustering", "markers", "plots", "report", "output")) {
     validate_section(section)
   }
 
@@ -142,10 +142,18 @@ validate_config <- function(config) {
   validate_number("qc.max_features", integer = TRUE, min = 0)
   validate_number("qc.max_percent_mt", min = 0, max = 100)
 
-  validate_string("normalization.method", allowed = c("lognormalize", "clr", "rc"))
+  validate_string("normalization.method", allowed = c("lognormalize", "clr", "rc", "sctransform", "scran"))
   validate_number("normalization.scale_factor", positive = TRUE)
   validate_string("normalization.variable_features", allowed = c("vst", "mean.var.plot", "dispersion"))
   validate_number("normalization.n_variable_features", integer = TRUE, min = 1)
+
+  validate_bool("modules.run_scater_qc")
+  validate_bool("modules.run_doublet_detection")
+  validate_bool("modules.run_annotation")
+  validate_string(
+    "modules.annotation_reference",
+    allowed = c("hpca", "blueprint_encode", "dice", "monaco", "mouse_rnaseq", "immgen")
+  )
 
   validate_number("reduction.n_pcs", integer = TRUE, min = 2)
   validate_number("reduction.umap_dims", integer = TRUE, min = 2)
@@ -220,6 +228,8 @@ required_packages <- c(
   "jsonlite",
   "Seurat",
   "SeuratObject",
+  "SingleCellExperiment",
+  "SummarizedExperiment",
   "Matrix",
   "fs",
   "glue",
@@ -234,6 +244,31 @@ if (isTRUE(get_param("plots.enabled", TRUE))) {
 if (isTRUE(get_param("report.enabled", TRUE))) {
   required_packages <- c(required_packages, "rmarkdown")
 }
+normalization_method_for_packages <- tolower(trimws(as.character(get_param("normalization.method", "LogNormalize"))))
+if (
+  normalization_method_for_packages == "scran" ||
+    isTRUE(get_param("modules.run_scater_qc", TRUE)) ||
+    isTRUE(get_param("modules.run_doublet_detection", TRUE)) ||
+    isTRUE(get_param("modules.run_annotation", TRUE))
+) {
+  required_packages <- c(required_packages, "SingleCellExperiment", "SummarizedExperiment")
+}
+if (normalization_method_for_packages == "scran" || isTRUE(get_param("modules.run_scater_qc", TRUE))) {
+  required_packages <- c(required_packages, "scater")
+}
+if (normalization_method_for_packages == "scran") {
+  required_packages <- c(required_packages, "scran")
+}
+if (normalization_method_for_packages == "sctransform") {
+  required_packages <- c(required_packages, "sctransform")
+}
+if (isTRUE(get_param("modules.run_doublet_detection", TRUE))) {
+  required_packages <- c(required_packages, "scDblFinder")
+}
+if (isTRUE(get_param("modules.run_annotation", TRUE))) {
+  required_packages <- c(required_packages, "SingleR", "celldex")
+}
+required_packages <- unique(required_packages)
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
@@ -256,9 +291,15 @@ max_features <- as.integer(get_param("qc.max_features", 6000))
 max_percent_mt <- as.numeric(get_param("qc.max_percent_mt", 10))
 
 normalization_method <- get_param("normalization.method", "LogNormalize")
+normalization_method_lower <- tolower(trimws(as.character(normalization_method)))
 scale_factor <- as.numeric(get_param("normalization.scale_factor", 10000))
 variable_features_method <- get_param("normalization.variable_features", "vst")
 n_variable_features <- as.integer(get_param("normalization.n_variable_features", 2000))
+
+run_scater_qc <- isTRUE(get_param("modules.run_scater_qc", TRUE))
+run_doublet_detection <- isTRUE(get_param("modules.run_doublet_detection", TRUE))
+run_annotation <- isTRUE(get_param("modules.run_annotation", TRUE))
+annotation_reference <- tolower(trimws(as.character(get_param("modules.annotation_reference", "hpca"))))
 
 n_pcs <- as.integer(get_param("reduction.n_pcs", 30))
 umap_dims <- as.integer(get_param("reduction.umap_dims", n_pcs))
@@ -357,7 +398,7 @@ log_message <- function(...) {
 
 writeLines(
   c(
-    "sc-PipeR version 0.1 run",
+    "sc-PipeR version 0.2 run",
     paste0("Started: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
     paste0("R version: ", getRversion()),
     paste0("Config: ", normalizePath(config_path, mustWork = FALSE)),
@@ -416,6 +457,126 @@ prepare_qc_columns <- function(object) {
     count_col = count_col,
     assay = assay
   )
+}
+
+seurat_to_sce <- function(object, assay = SeuratObject::DefaultAssay(object)) {
+  tryCatch(
+    Seurat::as.SingleCellExperiment(object, assay = assay),
+    error = function(err) {
+      abort(paste0("Unable to convert Seurat object to SingleCellExperiment: ", conditionMessage(err)))
+    }
+  )
+}
+
+coldata_to_data_frame <- function(sce_object) {
+  as.data.frame(SummarizedExperiment::colData(sce_object))
+}
+
+add_sce_columns_to_seurat <- function(object, sce_object, columns, prefix) {
+  coldata <- coldata_to_data_frame(sce_object)
+  matching_columns <- intersect(columns, colnames(coldata))
+
+  for (column in matching_columns) {
+    object[[paste0(prefix, column)]] <- coldata[colnames(object), column]
+  }
+
+  object
+}
+
+set_assay_data <- function(object, assay, data_layer) {
+  tryCatch(
+    SeuratObject::SetAssayData(object, assay = assay, layer = "data", new.data = data_layer),
+    error = function(layer_error) {
+      SeuratObject::SetAssayData(object, assay = assay, slot = "data", new.data = data_layer)
+    }
+  )
+}
+
+run_scater_qc_module <- function(object) {
+  log_message("Running scater QC metrics.")
+  sce_object <- seurat_to_sce(object, assay = active_assay)
+  mitochondrial_features <- grepl(mt_pattern, rownames(sce_object))
+  sce_object <- scater::addPerCellQC(sce_object, subsets = list(mito = mitochondrial_features))
+  scater_columns <- c("sum", "detected", "subsets_mito_sum", "subsets_mito_detected", "subsets_mito_percent")
+  object <- add_sce_columns_to_seurat(object, sce_object, scater_columns, "scater_")
+  scater_qc_table <- coldata_to_data_frame(sce_object)[colnames(object), scater_columns, drop = FALSE]
+  scater_qc_table <- tibble::rownames_to_column(scater_qc_table, var = "cell_barcode")
+
+  list(object = object, sce = sce_object, table = scater_qc_table)
+}
+
+run_doublet_detection_module <- function(object, sce_object = NULL) {
+  log_message("Running scDblFinder doublet detection.")
+  if (is.null(sce_object)) {
+    sce_object <- seurat_to_sce(object, assay = active_assay)
+  }
+
+  sce_object <- scDblFinder::scDblFinder(sce_object)
+  doublet_columns <- grep("^scDblFinder\\.", colnames(coldata_to_data_frame(sce_object)), value = TRUE)
+  object <- add_sce_columns_to_seurat(object, sce_object, doublet_columns, "")
+  doublet_table <- coldata_to_data_frame(sce_object)[colnames(object), doublet_columns, drop = FALSE]
+  doublet_table <- tibble::rownames_to_column(doublet_table, var = "cell_barcode")
+
+  list(object = object, sce = sce_object, table = doublet_table)
+}
+
+run_scran_normalization <- function(object) {
+  log_message("Normalizing data with scran.")
+  sce_object <- seurat_to_sce(object, assay = active_assay)
+  clusters <- scran::quickCluster(sce_object)
+  sce_object <- scran::computeSumFactors(sce_object, clusters = clusters)
+  sce_object <- scater::logNormCounts(sce_object)
+  object <- set_assay_data(object, active_assay, SummarizedExperiment::assay(sce_object, "logcounts"))
+
+  size_factor_table <- tibble::tibble(
+    cell_barcode = colnames(object),
+    scran_size_factor = SingleCellExperiment::sizeFactors(sce_object)
+  )
+  object[["scran_size_factor"]] <- size_factor_table$scran_size_factor
+
+  list(object = object, sce = sce_object, table = size_factor_table)
+}
+
+load_celldex_reference <- function(reference_name) {
+  switch(
+    reference_name,
+    hpca = celldex::HumanPrimaryCellAtlasData(),
+    blueprint_encode = celldex::BlueprintEncodeData(),
+    dice = celldex::DatabaseImmuneCellExpressionData(),
+    monaco = celldex::MonacoImmuneData(),
+    mouse_rnaseq = celldex::MouseRNAseqData(),
+    immgen = celldex::ImmGenData(),
+    abort(paste0("Unsupported annotation reference: ", reference_name))
+  )
+}
+
+reference_label_column <- function(reference) {
+  reference_coldata <- coldata_to_data_frame(reference)
+  if ("label.main" %in% colnames(reference_coldata)) {
+    return("label.main")
+  }
+  if ("label.fine" %in% colnames(reference_coldata)) {
+    return("label.fine")
+  }
+  abort("The selected celldex reference does not contain label.main or label.fine.")
+}
+
+run_annotation_module <- function(object) {
+  log_message("Running SingleR annotation.")
+  annotation_sce <- seurat_to_sce(object, assay = SeuratObject::DefaultAssay(object))
+  reference <- load_celldex_reference(annotation_reference)
+  label_column <- reference_label_column(reference)
+  reference_labels <- coldata_to_data_frame(reference)[[label_column]]
+  predictions <- SingleR::SingleR(test = annotation_sce, ref = reference, labels = reference_labels)
+  prediction_table <- as.data.frame(predictions)
+  prediction_table <- tibble::rownames_to_column(prediction_table, var = "cell_barcode")
+
+  object[["SingleR_label"]] <- prediction_table$labels[match(colnames(object), prediction_table$cell_barcode)]
+  if ("pruned.labels" %in% colnames(prediction_table)) {
+    object[["SingleR_pruned_label"]] <- prediction_table$pruned.labels[match(colnames(object), prediction_table$cell_barcode)]
+  }
+
+  list(object = object, table = prediction_table, reference = annotation_reference, label_column = label_column)
 }
 
 save_plot <- function(plot, path_without_ext, width = plot_width, height = plot_height) {
@@ -535,10 +696,55 @@ write_report <- function(plot_paths) {
   } else {
     "No plots were exported for this run.\n"
   }
+  module_sections <- character()
+  if (nrow(scater_qc_table) > 0) {
+    module_sections <- c(
+      module_sections,
+      "## scater QC Metrics",
+      "",
+      "```{r}",
+      "readr::read_csv('../tables/scater_qc_metrics.csv', show_col_types = FALSE)",
+      "```",
+      ""
+    )
+  }
+  if (nrow(doublet_table) > 0) {
+    module_sections <- c(
+      module_sections,
+      "## scDblFinder Doublet Calls",
+      "",
+      "```{r}",
+      "readr::read_csv('../tables/doublet_calls.csv', show_col_types = FALSE)",
+      "```",
+      ""
+    )
+  }
+  if (nrow(scran_size_factor_table) > 0) {
+    module_sections <- c(
+      module_sections,
+      "## scran Size Factors",
+      "",
+      "```{r}",
+      "readr::read_csv('../tables/scran_size_factors.csv', show_col_types = FALSE)",
+      "```",
+      ""
+    )
+  }
+  if (nrow(annotation_table) > 0) {
+    module_sections <- c(
+      module_sections,
+      "## SingleR Annotation",
+      "",
+      "```{r}",
+      "readr::read_csv('../tables/singleR_annotation.csv', show_col_types = FALSE)",
+      "```",
+      ""
+    )
+  }
 
   report_lines <- c(
     "---",
-    "title: \"sc-PipeR version 0.1 report\"",
+    "title: \"sc-PipeR version 0.2 report\"",
     "output:",
     "  html_document:",
     "    toc: true",
@@ -562,6 +768,9 @@ write_report <- function(plot_paths) {
     paste0("- UMAP dimensions used: ", umap_dims),
     paste0("- Clusters: ", dplyr::n_distinct(metadata$seurat_clusters)),
     paste0("- Marker rows: ", nrow(markers)),
+    paste0("- scater QC metrics: ", if (nrow(scater_qc_table) > 0) "enabled" else "not run"),
+    paste0("- Doublet calls: ", if (nrow(doublet_table) > 0) nrow(doublet_table) else "not run"),
+    paste0("- SingleR annotations: ", if (nrow(annotation_table) > 0) nrow(annotation_table) else "not run"),
     "",
     "## QC Summary",
     "",
@@ -575,6 +784,7 @@ write_report <- function(plot_paths) {
     "readr::read_csv('../tables/cluster_counts.csv', show_col_types = FALSE)",
     "```",
     "",
+    module_sections,
     "## Plots",
     "",
     plot_sections
@@ -661,24 +871,73 @@ if (ncol(seu) == 0) {
 qc_after <- qc_summary(seu, "after_filtering")
 qc_table <- dplyr::bind_rows(qc_before, qc_after)
 
-log_message("Normalizing data.")
-seu <- Seurat::NormalizeData(
-  object = seu,
-  normalization.method = normalization_method,
-  scale.factor = scale_factor,
-  verbose = FALSE
-)
+scater_qc_table <- tibble::tibble()
+doublet_table <- tibble::tibble()
+scran_size_factor_table <- tibble::tibble()
+annotation_table <- tibble::tibble()
 
-log_message("Finding variable features.")
-seu <- Seurat::FindVariableFeatures(
-  object = seu,
-  selection.method = variable_features_method,
-  nfeatures = n_variable_features,
-  verbose = FALSE
-)
+sce <- seurat_to_sce(seu, assay = active_assay)
 
-log_message("Scaling data.")
-seu <- Seurat::ScaleData(seu, verbose = FALSE)
+if (run_scater_qc) {
+  scater_result <- run_scater_qc_module(seu)
+  seu <- scater_result$object
+  sce <- scater_result$sce
+  scater_qc_table <- scater_result$table
+}
+
+if (run_doublet_detection) {
+  doublet_result <- run_doublet_detection_module(seu, sce)
+  seu <- doublet_result$object
+  sce <- doublet_result$sce
+  doublet_table <- doublet_result$table
+}
+
+if (normalization_method_lower %in% c("lognormalize", "clr", "rc")) {
+  log_message("Normalizing data with Seurat {normalization_method}.")
+  seu <- Seurat::NormalizeData(
+    object = seu,
+    normalization.method = normalization_method,
+    scale.factor = scale_factor,
+    verbose = FALSE
+  )
+
+  log_message("Finding variable features.")
+  seu <- Seurat::FindVariableFeatures(
+    object = seu,
+    selection.method = variable_features_method,
+    nfeatures = n_variable_features,
+    verbose = FALSE
+  )
+
+  log_message("Scaling data.")
+  seu <- Seurat::ScaleData(seu, verbose = FALSE)
+} else if (normalization_method_lower == "sctransform") {
+  log_message("Normalizing data with SCTransform.")
+  seu <- Seurat::SCTransform(
+    object = seu,
+    variable.features.n = n_variable_features,
+    verbose = FALSE
+  )
+  active_assay <- SeuratObject::DefaultAssay(seu)
+} else if (normalization_method_lower == "scran") {
+  scran_result <- run_scran_normalization(seu)
+  seu <- scran_result$object
+  sce <- scran_result$sce
+  scran_size_factor_table <- scran_result$table
+
+  log_message("Finding variable features.")
+  seu <- Seurat::FindVariableFeatures(
+    object = seu,
+    selection.method = variable_features_method,
+    nfeatures = n_variable_features,
+    verbose = FALSE
+  )
+
+  log_message("Scaling data.")
+  seu <- Seurat::ScaleData(seu, verbose = FALSE)
+} else {
+  abort(paste0("Unsupported normalization.method: ", normalization_method))
+}
 
 available_pcs <- min(n_pcs, ncol(seu) - 1, length(Seurat::VariableFeatures(seu)))
 if (available_pcs < 2) {
@@ -711,6 +970,12 @@ markers <- tryCatch(
     tibble::tibble()
   }
 )
+
+if (run_annotation) {
+  annotation_result <- run_annotation_module(seu)
+  seu <- annotation_result$object
+  annotation_table <- annotation_result$table
+}
 
 metadata <- tibble::rownames_to_column(seu@meta.data, var = "cell_barcode")
 cluster_counts <- metadata |>
@@ -750,6 +1015,10 @@ run_metadata <- list(
     marker_logfc_threshold = marker_logfc_threshold,
     marker_min_pct = marker_min_pct,
     marker_only_pos = marker_only_pos,
+    run_scater_qc = run_scater_qc,
+    run_doublet_detection = run_doublet_detection,
+    run_annotation = run_annotation,
+    annotation_reference = annotation_reference,
     plots_enabled = plots_enabled,
     plots_export_pdf = plots_export_pdf,
     plot_width = plot_width,
@@ -760,12 +1029,26 @@ run_metadata <- list(
   )
 )
 
+sce <- seurat_to_sce(seu, assay = SeuratObject::DefaultAssay(seu))
+
 log_message("Writing outputs.")
 readr::write_csv(qc_table, file.path(run_dir, "tables", "qc_summary.csv"))
 readr::write_csv(metadata, file.path(run_dir, "tables", "cell_metadata.csv"))
 readr::write_csv(cluster_counts, file.path(run_dir, "tables", "cluster_counts.csv"))
 readr::write_csv(markers, file.path(run_dir, "tables", "markers.csv"))
 readr::write_csv(umap_embeddings, file.path(run_dir, "tables", "umap_embeddings.csv"))
+if (nrow(scater_qc_table) > 0) {
+  readr::write_csv(scater_qc_table, file.path(run_dir, "tables", "scater_qc_metrics.csv"))
+}
+if (nrow(doublet_table) > 0) {
+  readr::write_csv(doublet_table, file.path(run_dir, "tables", "doublet_calls.csv"))
+}
+if (nrow(scran_size_factor_table) > 0) {
+  readr::write_csv(scran_size_factor_table, file.path(run_dir, "tables", "scran_size_factors.csv"))
+}
+if (nrow(annotation_table) > 0) {
+  readr::write_csv(annotation_table, file.path(run_dir, "tables", "singleR_annotation.csv"))
+}
 jsonlite::write_json(
   run_metadata,
   file.path(run_dir, "logs", "run_metadata.json"),
@@ -777,6 +1060,7 @@ jsonlite::write_json(
 if (save_seurat_object) {
   saveRDS(seu, file.path(run_dir, "objects", "seurat_processed.rds"))
 }
+saveRDS(sce, file.path(run_dir, "objects", "single_cell_experiment.rds"))
 
 plot_paths <- write_plot_outputs(seu, markers)
 if (length(plot_paths) > 0) {
@@ -793,7 +1077,7 @@ writeLines(
 )
 
 summary_lines <- c(
-  "sc-PipeR version 0.1 run complete",
+  "sc-PipeR version 0.2 run complete",
   paste0("Completed: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
   paste0("Output directory: ", normalizePath(run_dir, mustWork = FALSE)),
   paste0("Input path: ", normalizePath(input_path, mustWork = FALSE)),
@@ -807,6 +1091,16 @@ summary_lines <- c(
   paste0("UMAP dims used: ", umap_dims),
   paste0("Clusters: ", dplyr::n_distinct(metadata$seurat_clusters)),
   paste0("Marker rows: ", nrow(markers)),
+  paste0("scater QC metrics: ", if (nrow(scater_qc_table) > 0) "written" else "not run"),
+  paste0(
+    "Doublets detected: ",
+    if (nrow(doublet_table) > 0 && "scDblFinder.class" %in% colnames(doublet_table)) {
+      sum(doublet_table[["scDblFinder.class"]] == "doublet", na.rm = TRUE)
+    } else {
+      "not run"
+    }
+  ),
+  paste0("SingleR annotations: ", if (nrow(annotation_table) > 0) nrow(annotation_table) else "not run"),
   paste0("Plot files: ", length(plot_paths)),
   paste0("HTML report: ", report_path %||% "not generated")
 )

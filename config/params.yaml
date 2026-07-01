@@ -1,5 +1,5 @@
 project:
-  name: scPipeR_ver0.1
+  name: scPipeR_ver0.2
   organism: human
   seed: 1234
 
@@ -19,6 +19,12 @@ normalization:
   scale_factor: 10000
   variable_features: vst
   n_variable_features: 2000
+
+modules:
+  run_scater_qc: true
+  run_doublet_detection: true
+  run_annotation: true
+  annotation_reference: hpca
 
 reduction:
   n_pcs: 30
